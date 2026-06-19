@@ -54,6 +54,7 @@ export class PhysicsEngine {
   private tickEvents: TickEvent[] = [];
   private onTickCallback?: (event: TickEvent) => void;
   private previousStates: Map<string, PartState> = new Map();
+  private elapsedSimTime: number = 0;
 
   constructor(config: Partial<PhysicsConfig> = {}) {
     this.config = { ...DEFAULT_PHYSICS_CONFIG, ...config };
@@ -201,6 +202,7 @@ export class PhysicsEngine {
     const subDt = dt / this.config.subSteps;
 
     for (let s = 0; s < this.config.subSteps; s++) {
+      this.elapsedSimTime += subDt;
       this.savePreviousStates();
 
       this.applyBarrelTorques();
@@ -231,6 +233,17 @@ export class PhysicsEngine {
         body.state.appliedTorque += torque;
       }
     });
+  }
+
+  private getTotalBarrelTorque(): number {
+    let total = 0;
+    this.bodies.forEach((body) => {
+      if (body.part.type === 'barrel') {
+        const barrel = body.part as BarrelPart;
+        total += barrel.maxTorque * (barrel.energy > 0 ? 1 : 0);
+      }
+    });
+    return total;
   }
 
   private solveConstraintsForTorques(): void {
@@ -391,7 +404,7 @@ export class PhysicsEngine {
     };
   }
 
-  private processEscapements(simTime: number): void {
+  private processEscapements(dt: number): void {
     this.solverConstraints.forEach((constraint) => {
       if (constraint.type !== 'escapement_lock' || !constraint.active) return;
 
@@ -406,6 +419,8 @@ export class PhysicsEngine {
       const previousBalanceState = this.previousStates.get(data.balanceId);
       if (!previousBalanceState) return;
 
+      const barrelDrivingTorque = this.getTotalBarrelTorque();
+
       const result = updateEscapement(
         data,
         balanceBody.part as BalancePart,
@@ -413,7 +428,9 @@ export class PhysicsEngine {
         balanceBody.state,
         wheelBody.state,
         previousBalanceState,
-        simTime
+        this.elapsedSimTime,
+        dt,
+        barrelDrivingTorque
       );
 
       constraint.data = result.data;
@@ -472,5 +489,6 @@ export class PhysicsEngine {
     this.previousStates.clear();
     this.solverConstraints = [];
     this.tickEvents = [];
+    this.elapsedSimTime = 0;
   }
 }

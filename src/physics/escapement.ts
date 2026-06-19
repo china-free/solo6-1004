@@ -1,9 +1,12 @@
 import type { EscapementPart, PartState, BalancePart, GearPart } from '../types';
-import { normalizeAngle, shortestAngleDelta, TWO_PI } from '../utils/math';
+import { normalizeAngle, shortestAngleDelta, TWO_PI, clamp } from '../utils/math';
 import type { EscapementConstraintData, EscapementState, TickEvent } from './types';
 
-const IMPULSE_ENERGY = 0.00005;
+const IMPULSE_ENERGY_PER_UNIT_I = 0.05;
+const MIN_IMPULSE_ENERGY = 0.00001;
+const MAX_IMPULSE_ENERGY = 0.001;
 const LOCK_THRESHOLD = 0.85;
+const TARGET_AMPLITUDE_RATIO = 0.75;
 
 export const createEscapementState = (): EscapementState => {
   return {
@@ -75,31 +78,57 @@ export const checkLockRelease = (
 
 export const advanceEscapementWheel = (
   wheelState: PartState,
-  wheelTeeth: number
-): PartState => {
+  wheelTeeth: number,
+  wheelInertia: number,
+  dt: number,
+  drivingTorque: number = 0
+): { newState: PartState; angularImpulse: number } => {
   const toothAngle = TWO_PI / wheelTeeth;
+  const currentAngle = wheelState.angle;
+  const targetAngle = currentAngle - toothAngle;
+  const angleDelta = shortestAngleDelta(currentAngle, targetAngle);
+  const targetAngularVelocity = angleDelta / Math.max(dt, 0.0001);
+  const velocityDelta = targetAngularVelocity - wheelState.angularVelocity;
+  const angularImpulse = Math.max(wheelInertia, 0.000001) * velocityDelta;
+  const impulseTorque = angularImpulse / Math.max(dt, 0.0001);
+
   return {
-    ...wheelState,
-    angle: wheelState.angle - toothAngle,
-    appliedTorque: 0,
+    newState: {
+      ...wheelState,
+      appliedTorque: wheelState.appliedTorque + impulseTorque + drivingTorque,
+    },
+    angularImpulse,
   };
 };
 
 export const impartImpulse = (
   balanceState: PartState,
-  energy: number = IMPULSE_ENERGY
+  balanceInertia: number,
+  amplitudeLimit: number,
+  currentAngle: number
 ): { newState: PartState; energyImparted: number } => {
-  const currentKineticEnergy = 0.5 * balanceState.angularVelocity * balanceState.angularVelocity;
-  const newKineticEnergy = currentKineticEnergy + energy;
-  const velocitySign = balanceState.angularVelocity >= 0 ? 1 : -1;
-  const newVelocity = velocitySign * Math.sqrt(Math.max(0, newKineticEnergy * 2));
+  const I = Math.max(balanceInertia, 0.000001);
+  const omega = balanceState.angularVelocity;
+  const currentKE = 0.5 * I * omega * omega;
+  const currentAmplitude = Math.abs(currentAngle);
+  const targetAmplitude = amplitudeLimit * TARGET_AMPLITUDE_RATIO;
+  const amplitudeDeficit = Math.max(0, targetAmplitude - currentAmplitude);
+  const amplitudeRatio = amplitudeDeficit / Math.max(amplitudeLimit, 0.001);
+  const baseEnergy = IMPULSE_ENERGY_PER_UNIT_I * I;
+  const scaledEnergy = baseEnergy * (0.5 + amplitudeRatio * 1.5);
+  const impulseEnergy = clamp(scaledEnergy, MIN_IMPULSE_ENERGY, MAX_IMPULSE_ENERGY);
+  const targetKE = currentKE + impulseEnergy;
+  const velocitySign = omega >= 0 ? 1 : -1;
+  const targetVelocity = velocitySign * Math.sqrt(Math.max(0, (2 * targetKE) / I));
+  const maxSafeVelocity = amplitudeLimit * 8;
+  const clampedVelocity = clamp(targetVelocity, -maxSafeVelocity, maxSafeVelocity);
 
   return {
     newState: {
       ...balanceState,
-      angularVelocity: newVelocity,
+      angularVelocity: clampedVelocity,
     },
-    energyImparted: energy,
+    energyImparted: impulseEnergy,
   };
 };
 
@@ -110,7 +139,9 @@ export const updateEscapement = (
   balanceState: PartState,
   wheelState: PartState,
   previousBalanceState: PartState,
-  currentTime: number
+  currentTime: number,
+  dt: number,
+  barrelDrivingTorque: number = 0
 ): {
   data: EscapementConstraintData;
   balanceState: PartState;
@@ -137,9 +168,21 @@ export const updateEscapement = (
       newData.state.palletLocked = false;
       newData.state.lockedSide = null;
 
-      newWheelState = advanceEscapementWheel(newWheelState, wheel.teeth);
+      const wheelAdvance = advanceEscapementWheel(
+        newWheelState,
+        wheel.teeth,
+        wheel.inertia,
+        dt,
+        barrelDrivingTorque
+      );
+      newWheelState = wheelAdvance.newState;
 
-      const impulse = impartImpulse(newBalanceState);
+      const impulse = impartImpulse(
+        newBalanceState,
+        balance.inertia,
+        balance.amplitudeLimit,
+        newBalanceState.angle
+      );
       newBalanceState = impulse.newState;
 
       newData.state.lastReleaseAngle = newBalanceState.angle;

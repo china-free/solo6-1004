@@ -4,41 +4,22 @@ import type {
   PhysicsConfig,
   PhysicsState,
   Constraint,
-  GearPart,
-  SpringPart,
-  EscapementPart,
-  BalancePart,
   BarrelPart,
+  BalancePart,
 } from '../types';
 import { rk4Integrate, clamp } from '../utils/math';
 import type {
   RigidBody,
   SolverConstraint,
   TickEvent,
-  GearMeshConstraintData,
-  CoaxialConstraintData,
-  SpringConstraintData,
-  EscapementConstraintData,
   TorqueFunction,
 } from './types';
-import {
-  createGearMeshConstraint,
-  createCoaxialConstraint,
-  computeGearMeshTorques,
-  computeCoaxialTorques,
-  createGearMeshTorqueFunction,
-  createCoaxialTorqueFunction,
-} from './constraints';
-import {
-  createSpringConstraint,
-  computeSpringTorque,
-  createSpringTorqueFunction,
-} from './springs';
-import {
-  createEscapementConstraint,
-  updateEscapement,
-  computeEscapementLockingTorque,
-} from './escapement';
+import type { SolverContext } from './solvers/types';
+import { ConstraintSolverRegistry } from './solvers/registry';
+import { gearMeshSolver } from './solvers/gearMeshSolver';
+import { coaxialSolver } from './solvers/coaxialSolver';
+import { springSolver } from './solvers/springSolver';
+import { escapementSolver } from './solvers/escapementSolver';
 
 export const DEFAULT_PHYSICS_CONFIG: PhysicsConfig = {
   gravity: 9.81,
@@ -55,9 +36,15 @@ export class PhysicsEngine {
   private onTickCallback?: (event: TickEvent) => void;
   private previousStates: Map<string, PartState> = new Map();
   private elapsedSimTime: number = 0;
+  private solverRegistry: ConstraintSolverRegistry;
 
   constructor(config: Partial<PhysicsConfig> = {}) {
     this.config = { ...DEFAULT_PHYSICS_CONFIG, ...config };
+    this.solverRegistry = new ConstraintSolverRegistry();
+    this.solverRegistry.register(gearMeshSolver);
+    this.solverRegistry.register(coaxialSolver);
+    this.solverRegistry.register(springSolver);
+    this.solverRegistry.register(escapementSolver);
   }
 
   setOnTick(callback: (event: TickEvent) => void): void {
@@ -101,43 +88,11 @@ export class PhysicsEngine {
   }
 
   private buildSolverConstraint(constraint: Constraint): SolverConstraint | null {
-    const partA = this.bodies.get(constraint.partA);
-    const partB = this.bodies.get(constraint.partB);
-
-    switch (constraint.type) {
-      case 'gear_mesh': {
-        if (!partA || !partB || partA.part.type !== 'gear' || partB.part.type !== 'gear') {
-          return null;
-        }
-        return {
-          ...constraint,
-          data: createGearMeshConstraint(partA.part as GearPart, partB.part as GearPart),
-        };
-      }
-      case 'coaxial': {
-        if (!partA || !partB) return null;
-        return {
-          ...constraint,
-          data: createCoaxialConstraint(constraint.partA, constraint.partB),
-        };
-      }
-      case 'spring_torque': {
-        if (!partA || partA.part.type !== 'spring') return null;
-        return {
-          ...constraint,
-          data: createSpringConstraint(partA.part as SpringPart),
-        };
-      }
-      case 'escapement_lock': {
-        if (!partA || partA.part.type !== 'escapement') return null;
-        return {
-          ...constraint,
-          data: createEscapementConstraint(partA.part as EscapementPart),
-        };
-      }
-      default:
-        return null;
-    }
+    const partA = this.bodies.get(constraint.partA)?.part;
+    const partB = this.bodies.get(constraint.partB)?.part;
+    const data = this.solverRegistry.buildData(constraint, partA, partB);
+    if (data === null) return null;
+    return { ...constraint, data };
   }
 
   getPartState(partId: string): PartState | undefined {
@@ -211,7 +166,7 @@ export class PhysicsEngine {
 
       this.integrateBodies(subDt);
 
-      this.processEscapements(subDt);
+      this.postIntegrateConstraints(subDt);
 
       this.applyDamping(subDt);
 
@@ -235,7 +190,7 @@ export class PhysicsEngine {
     });
   }
 
-  private getTotalBarrelTorque(): number {
+  getTotalBarrelTorque(): number {
     let total = 0;
     this.bodies.forEach((body) => {
       if (body.part.type === 'barrel') {
@@ -246,55 +201,25 @@ export class PhysicsEngine {
     return total;
   }
 
+  private buildSolverContext(): SolverContext {
+    return {
+      bodies: this.bodies,
+      previousStates: this.previousStates,
+      elapsedSimTime: this.elapsedSimTime,
+      getTotalBarrelTorque: () => this.getTotalBarrelTorque(),
+      onTick: this.onTickCallback,
+      collectTickEvent: (event: TickEvent) => {
+        this.tickEvents.push(event);
+        if (this.onTickCallback) {
+          this.onTickCallback(event);
+        }
+      },
+    };
+  }
+
   private solveConstraintsForTorques(): void {
-    this.solverConstraints.forEach((constraint) => {
-      if (!constraint.active) return;
-
-      switch (constraint.type) {
-        case 'gear_mesh': {
-          const data = constraint.data as GearMeshConstraintData;
-          const bodyA = this.bodies.get(data.gearA);
-          const bodyB = this.bodies.get(data.gearB);
-          if (!bodyA || !bodyB) break;
-
-          const { torqueA, torqueB } = computeGearMeshTorques(data, bodyA.state, bodyB.state);
-          bodyA.state.appliedTorque += torqueA;
-          bodyB.state.appliedTorque += torqueB;
-          break;
-        }
-        case 'coaxial': {
-          const data = constraint.data as CoaxialConstraintData;
-          const bodyA = this.bodies.get(data.partA);
-          const bodyB = this.bodies.get(data.partB);
-          if (!bodyA || !bodyB) break;
-
-          const { torqueA, torqueB } = computeCoaxialTorques(data, bodyA.state, bodyB.state);
-          bodyA.state.appliedTorque += torqueA;
-          bodyB.state.appliedTorque += torqueB;
-          break;
-        }
-        case 'spring_torque': {
-          const data = constraint.data as SpringConstraintData;
-          const innerBody = this.bodies.get(data.innerPart);
-          const outerBody = this.bodies.get(data.outerPart);
-          if (!innerBody || !outerBody) break;
-
-          const { innerTorque, outerTorque } = computeSpringTorque(data, innerBody.state, outerBody.state);
-          innerBody.state.appliedTorque += innerTorque;
-          outerBody.state.appliedTorque += outerTorque;
-          break;
-        }
-        case 'escapement_lock': {
-          const data = constraint.data as EscapementConstraintData;
-          const balanceBody = this.bodies.get(data.balanceId);
-          if (!balanceBody) break;
-
-          const lockingTorque = computeEscapementLockingTorque(data, balanceBody.state);
-          balanceBody.state.appliedTorque += lockingTorque;
-          break;
-        }
-      }
-    });
+    const ctx = this.buildSolverContext();
+    this.solverRegistry.applyAll(this.solverConstraints, ctx);
   }
 
   private integrateBodies(dt: number): void {
@@ -325,125 +250,25 @@ export class PhysicsEngine {
 
   private buildTorqueFunction(body: RigidBody): TorqueFunction {
     const baseTorque = body.state.appliedTorque;
-    const selfState = body.state;
-
-    const constraintTorqueFuncs: TorqueFunction[] = [];
-
-    this.solverConstraints.forEach((constraint) => {
-      if (!constraint.active) return;
-
-      switch (constraint.type) {
-        case 'gear_mesh': {
-          const data = constraint.data as GearMeshConstraintData;
-          if (data.gearA === body.id) {
-            constraintTorqueFuncs.push(
-              createGearMeshTorqueFunction(
-                data,
-                () => this.bodies.get(data.gearA)!.state,
-                () => this.bodies.get(data.gearB)!.state,
-                'A'
-              )
-            );
-          } else if (data.gearB === body.id) {
-            constraintTorqueFuncs.push(
-              createGearMeshTorqueFunction(
-                data,
-                () => this.bodies.get(data.gearA)!.state,
-                () => this.bodies.get(data.gearB)!.state,
-                'B'
-              )
-            );
-          }
-          break;
-        }
-        case 'coaxial': {
-          const data = constraint.data as CoaxialConstraintData;
-          if (data.partA === body.id) {
-            constraintTorqueFuncs.push(
-              createCoaxialTorqueFunction(
-                data,
-                () => this.bodies.get(data.partA)!.state,
-                () => this.bodies.get(data.partB)!.state,
-                'A'
-              )
-            );
-          } else if (data.partB === body.id) {
-            constraintTorqueFuncs.push(
-              createCoaxialTorqueFunction(
-                data,
-                () => this.bodies.get(data.partA)!.state,
-                () => this.bodies.get(data.partB)!.state,
-                'B'
-              )
-            );
-          }
-          break;
-        }
-        case 'spring_torque': {
-          const data = constraint.data as SpringConstraintData;
-          if (data.innerPart === body.id) {
-            constraintTorqueFuncs.push(
-              createSpringTorqueFunction(
-                data,
-                () => this.bodies.get(data.innerPart)!.state,
-                () => this.bodies.get(data.outerPart)!.state
-              )
-            );
-          }
-          break;
-        }
-      }
-    });
+    const ctx = this.buildSolverContext();
+    const constraintFuncs = this.solverRegistry.buildAllTorqueFunctions(
+      body.id,
+      this.solverConstraints,
+      ctx
+    );
 
     return (theta: number, omega: number): number => {
       let total = baseTorque;
-      for (const func of constraintTorqueFuncs) {
+      for (const func of constraintFuncs) {
         total += func(theta, omega);
       }
       return total;
     };
   }
 
-  private processEscapements(dt: number): void {
-    this.solverConstraints.forEach((constraint) => {
-      if (constraint.type !== 'escapement_lock' || !constraint.active) return;
-
-      const data = constraint.data as EscapementConstraintData;
-      const escapementBody = this.bodies.get(data.escapementId);
-      const balanceBody = this.bodies.get(data.balanceId);
-      const wheelBody = this.bodies.get(data.wheelId);
-
-      if (!escapementBody || !balanceBody || !wheelBody) return;
-      if (balanceBody.part.type !== 'balance' || wheelBody.part.type !== 'gear') return;
-
-      const previousBalanceState = this.previousStates.get(data.balanceId);
-      if (!previousBalanceState) return;
-
-      const barrelDrivingTorque = this.getTotalBarrelTorque();
-
-      const result = updateEscapement(
-        data,
-        balanceBody.part as BalancePart,
-        wheelBody.part as GearPart,
-        balanceBody.state,
-        wheelBody.state,
-        previousBalanceState,
-        this.elapsedSimTime,
-        dt,
-        barrelDrivingTorque
-      );
-
-      constraint.data = result.data;
-      balanceBody.state = result.balanceState;
-      wheelBody.state = result.wheelState;
-
-      if (result.tickEvent) {
-        this.tickEvents.push(result.tickEvent);
-        if (this.onTickCallback) {
-          this.onTickCallback(result.tickEvent);
-        }
-      }
-    });
+  private postIntegrateConstraints(dt: number): void {
+    const ctx = this.buildSolverContext();
+    this.solverRegistry.postIntegrateAll(this.solverConstraints, dt, ctx);
   }
 
   private applyDamping(dt: number): void {
